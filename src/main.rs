@@ -1,25 +1,20 @@
 mod files;
+
 extern crate clap;
 use chrono::{NaiveDate, NaiveDateTime};
 use clap::Parser;
-use files::FileMeta;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, SystemTimeError};
+use std::path::{PathBuf};
 
 struct CopyStats {
 	bytes: u64,
 	files: u64,
 }
 
-// TODO Don't get all the files at once, instead make an iterator that returns a vec of all files in a directory, and it does this recursively.
-// That way, we only get one directory's worth of files at a time for less memory pressure and also we can notice changes that happen midway
-// through the backup if they're snuck in fast enough. It also makes the backup run in a more predictable order.
 // TODO should be able to exclude symlinks/hardlinks/junctions from the source directories
-// TODO toggle making hardlinks or not when the file is unchanged (default: true, so the switch should be like -nl)
 #[derive(Parser, Debug)]
 #[clap(name = "incbackup")]
 #[clap(author = "Michael McBride")]
@@ -30,10 +25,12 @@ struct Arguments {
 	src_dirs: Vec<String>,
 	#[clap(short = 'x', long = "exclude", help = "Any files or directories with one of these names will be excluded from the backup")]
 	excluded_names: Option<Vec<String>>,
-	#[clap(short = 's', long = "stats", help = "If specified, will append stats to this file as comma-separated values (date,total_bytes_copied,total_files_copied)")]
+	#[clap(short = 's', long = "stats", help = "If present, will append stats to this file as comma-separated values (date,total_bytes_copied,total_files_copied)")]
 	path_stats: Option<String>,
 	#[clap(short = 'm', long = "min-diff", default_value_t = 1, help = "If the file modification time differs by at least this many seconds, the file will be backed up")]
 	min_diff_secs: u64,
+	#[clap(short = 'v', long = "verbose", help = "If present, will output information for all links created")]
+	verbose: bool,
 }
 
 fn main() {
@@ -113,12 +110,11 @@ fn main() {
 		}
 	}
 	let dest_base_dir = &backup_base_dir_working;
-	let prev_files;
+	let mut prev_files_collector = files::CollectorFileHandler{files: HashMap::new()};
 
 	if let Some(prev_base_dir) = maybe_prev_base_dir {
-		match files::get_files_recursive(&prev_base_dir, &excluded_names) {
-			Ok(ok) => {
-				prev_files = ok.files;
+		match files::handle_files_recursive(&prev_base_dir, &excluded_names, &mut prev_files_collector) {
+			Ok(_) => {
 				println!("Previous backup directory: {}", &prev_base_dir.display());
 			}
 			Err(err) => {
@@ -131,9 +127,9 @@ fn main() {
 			}
 		}
 	} else {
-		prev_files = HashMap::new();
 		println!("First backup, everything will be copied");
 	}
+	let prev_files = prev_files_collector.files;
 
 	let mut total_bytes_copied = 0u64;
 	let mut total_files_copied = 0u64;
@@ -161,56 +157,60 @@ fn main() {
 			maybe_prev_dir = None;
 		}
 
+		match std::fs::create_dir_all(&dest_dir){
+			Ok(_) =>{}
+			Err(err) => {
+				println!("Failed to create directory {} because {}", &dest_dir.display(), err);
+				return;
+			}
+		}
+
 		println!(
 			"Backing up \"{}\" to \"{}\"",
 			&src_base_dir.display(),
 			&dest_dir.display()
 		);
-
-		match files::get_files_recursive(&src_base_dir, &excluded_names) {
-			Ok(src_files_dirs) => {
-				// First, we need to create all the directories
-				println!("Creating {} directories...", src_files_dirs.dirs.len());
-				for src_dir_path in src_files_dirs.dirs.iter() {
-					let src_dir = src_dir_path.strip_prefix(&src_base_dir).unwrap(); // TODO don't panic here
-					let mut dir_to_create = PathBuf::from(&dest_dir);
-					dir_to_create.push(&src_dir);
-					if !dir_to_create.exists() {
-						match std::fs::create_dir_all(&dir_to_create) {
-							Ok(_) => {}
-							Err(err) => {
-								println!(
-									"Failed to create directory ({}): {}",
-									&dir_to_create.display(),
-									&err
-								);
-								return;
-							}
-						}
-					}
-				}
-				println!("Done!");
-
-				println!(
-					"There are {} files to check...",
-					&src_files_dirs.files.len()
-				);
-				let stats = match maybe_prev_dir {
-					Some(prev_dir) => copy_or_hardlink_files(
-						&src_files_dirs.files,
-						&prev_files,
-						&src_base_dir,
-						&dest_dir,
-						&prev_dir,
-						args.min_diff_secs,
-					),
-					None => copy_files(&src_files_dirs.files, &src_base_dir, &dest_dir),
+		
+		let result = 
+		match maybe_prev_dir {
+			Some(prev_dir) => {
+				let mut handler = files::LinkOrCopyFileHandler
+				{
+					prev_files: &prev_files,
+					src_base_dir: &src_base_dir,
+					dest_dir: &dest_dir,
+					prev_dir: &prev_dir,
+					min_diff_secs: args.min_diff_secs,
+					bytes_copied: 0,
+					files_copied: 0,
+					verbose: args.verbose,
 				};
+				match files::handle_files_recursive(&src_base_dir, &excluded_names, &mut handler) {
+					Ok(_) => {Ok(CopyStats{bytes: handler.bytes_copied, files: handler.files_copied})}
+					Err(err) => {Err(err)}
+				}
+			}
+			None => {
+				let mut handler = files::CopyFileHandler
+				{
+					src_base_dir: &src_base_dir,
+					dest_dir: &dest_dir,
+					bytes_copied: 0,
+					files_copied: 0,
+				};
+				match files::handle_files_recursive(&src_base_dir, &excluded_names, &mut handler) {
+					Ok(_) => {Ok(CopyStats{bytes: handler.bytes_copied, files: handler.files_copied})}
+					Err(err) => {Err(err)}
+				}
+			}
+		};
+		match result {
+			Ok(stats) => {
 				total_bytes_copied += stats.bytes;
 				total_files_copied += stats.files;
 			}
 			Err(err) => {
-				println!("\x1b[mError reading directory: {}", &err);
+				println!("Error occurred for source directory {} while doing backup: {}", src_base_dir.display(), err);
 				return;
 			}
 		}
@@ -306,126 +306,4 @@ fn dest_dir_from_src_leaf_dir(src: &PathBuf, dest: &PathBuf, buf: &mut PathBuf) 
 		return Some(());
 	}
 	return None;
-}
-
-fn diff_secs(t1: &SystemTime, t2: &SystemTime) -> Result<u64, SystemTimeError> {
-	let seconds1 = t1.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-	let seconds2 = t2.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-
-	// Return the absolute difference in seconds
-	if seconds1 > seconds2 {
-		Ok(seconds1 - seconds2)
-	} else {
-		Ok(seconds2 - seconds1)
-	}
-}
-
-fn copy_files(
-	files: &HashMap<PathBuf, FileMeta>,
-	src_base_dir: &Path,
-	dest_dir: &Path,
-) -> CopyStats {
-	let mut bytes: u64 = 0;
-	let mut num: u64 = 0;
-	for (src_path, _) in files.iter() {
-		let src_file = src_path.strip_prefix(&src_base_dir).unwrap(); // TODO don't panic here
-		let mut dest_path = PathBuf::from(&dest_dir);
-		dest_path.push(&src_file);
-
-		match std::fs::copy(&src_path, &dest_path) {
-			Ok(bytes_copied) => {
-				bytes += bytes_copied;
-				num += 1;
-				println!("\x1b[92mCopied: {}", &src_path.display());
-			}
-			Err(err) => {
-				println!("\x1b[91mFailed to copy file: {}", &err);
-			}
-		}
-	}
-
-	CopyStats {
-		bytes: bytes,
-		files: num,
-	}
-}
-
-fn copy_or_hardlink_files(
-	files: &HashMap<PathBuf, FileMeta>,
-	prev_files: &HashMap<PathBuf, FileMeta>,
-	src_base_dir: &Path,
-	dest_dir: &Path,
-	prev_dir: &Path,
-	min_diff_secs: u64
-) -> CopyStats {
-	let mut bytes: u64 = 0;
-	let mut num: u64 = 0;
-	for (src_path, src_meta) in files.iter() {
-		// Now, for each of the directories we have in the source, we need to check recursively all of the files etc.
-		// And there's outcomes...
-		// Same length/modified, make hardlink
-		// Different length/modified, copy new
-		// New file, copy
-		// Because the backup folder is always empty to begin with, we don't have to worry about deleting anything
-
-		let src_file = src_path.strip_prefix(&src_base_dir).unwrap(); // TODO don't panic here
-		let mut dest_path = PathBuf::from(&dest_dir);
-		dest_path.push(&src_file);
-		let mut prev_path = PathBuf::from(&prev_dir);
-		prev_path.push(&src_file);
-
-		let copy;
-
-		if let Some(prev_meta) = prev_files.get(&prev_path) {
-			if src_meta.len == prev_meta.len {
-				// lengths are the same so compare the modification times
-				match diff_secs(&src_meta.modified, &prev_meta.modified) {
-					Ok(secs) => {
-						// If the modification time in seconds differs by at least 2 seconds, then assume it has changed and needs to be copied
-						copy = secs >= min_diff_secs;
-					}
-					Err(err) => {
-						// Can't tell, so be conservative and assume it's changed
-						println!(
-							"\x1b[mCannot compare filetimes ({}), assuming file has changed",
-							&err
-						);
-						copy = true;
-					}
-				}
-			} else {
-				// lengths are different, file's definitely changed
-				copy = true;
-			}
-		} else {
-			// File is new, copy the file to the new directory
-			copy = true;
-		}
-
-		if copy {
-			match std::fs::copy(&src_path, &dest_path) {
-				Ok(bytes_copied) => {
-					bytes += bytes_copied;
-					num += 1;
-					println!("\x1b[92mChanged: {}", &src_path.display());
-				}
-				Err(err) => {
-					println!("\x1b[91mFailed to copy file: {}", &err);
-				}
-			}
-		} else {
-			match std::fs::hard_link(&prev_path, &dest_path) {
-				Ok(_) => {}
-				Err(err) => {
-					println!("\x1b[91mFailed to hardlink file: {}", err);
-				}
-			}
-		}
-	}
-	// Reset the colours
-	print!("\x1b[m");
-	CopyStats {
-		bytes: bytes,
-		files: num,
-	}
 }
